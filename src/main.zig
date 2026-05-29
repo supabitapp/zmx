@@ -12,6 +12,8 @@ const socket = @import("socket.zig");
 pub const version = build_options.version;
 pub const ghostty_version = build_options.ghostty_version;
 
+const default_shell_command_flag = "--default-shell-command";
+
 var log_system = log.LogSystem{};
 
 pub const std_options: std.Options = .{
@@ -141,7 +143,12 @@ pub fn main() !void {
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
+        var default_shell_command: ?[]const u8 = null;
         while (args.next()) |arg| {
+            if (command_args.items.len == 0 and default_shell_command == null and std.mem.eql(u8, arg, default_shell_command_flag)) {
+                default_shell_command = args.next() orelse return error.CommandRequired;
+                continue;
+            }
             try command_args.append(alloc, arg);
         }
 
@@ -165,6 +172,7 @@ pub fn main() !void {
             .socket_path = undefined,
             .pid = undefined,
             .command = command,
+            .default_shell_command = default_shell_command,
             .cwd = cwd,
             .created_at = @intCast(std.time.timestamp()),
             .leader_client_fd = null,
@@ -586,6 +594,7 @@ const Daemon = struct {
     running: bool,
     pid: i32,
     command: ?[]const []const u8 = null,
+    default_shell_command: ?[]const u8 = null,
     cwd: []const u8 = "",
     has_pty_output: bool = false,
     has_had_client: bool = false,
@@ -680,6 +689,14 @@ const Daemon = struct {
             }
             const err = std.posix.execvpeZ(argv[0].?, argv.ptr, std.c.environ);
             std.log.err("execvpe failed: cmd={s} err={s}", .{ cmd_args[0], @errorName(err) });
+            std.posix.exit(1);
+        }
+
+        if (self.default_shell_command) |command| {
+            const shell_command = try alloc.dupeZ(u8, command);
+            const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", shell_command.ptr, null };
+            const err = std.posix.execvpeZ(argv[0].?, &argv, std.c.environ);
+            std.log.err("execvpe failed: cmd={s} err={s}", .{ command, @errorName(err) });
             std.posix.exit(1);
         }
 
