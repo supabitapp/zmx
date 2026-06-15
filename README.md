@@ -56,7 +56,7 @@ brew install neurosnap/tap/zmx
 
 ### src
 
-- Requires zig `v0.15`
+- Requires zig `0.15.2`
 - Clone the repo
 - Run build cmd
 
