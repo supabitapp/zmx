@@ -849,9 +849,7 @@ pub const Daemon = struct {
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
         // SIGWINCH-triggered redraw will run after our snapshot is sent.
-        // Only serialize on re-attach (has_had_client), not first attach, to avoid
-        // interfering with shell initialization (DA1 queries, etc.)
-        if (self.has_pty_output and self.has_had_client) {
+        if (self.has_pty_output and (self.has_had_client or self.command != null)) {
             const cursor = &term.screens.active.cursor;
             std.log.debug(
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
@@ -1209,4 +1207,39 @@ test "send queues PTY input without changing leader" {
 
     try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("hello", daemon.pty_write_buf.items);
+}
+
+test "first attach replays explicit command output" {
+    const alloc = std.testing.allocator;
+    const command = [_][]const u8{"/bin/zsh"};
+    var daemon = Daemon{
+        .cfg = undefined,
+        .session_name = "test",
+        .socket_path = "",
+        .command = &command,
+        .has_pty_output = true,
+        .created_at = 0,
+    };
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = -1,
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = .empty,
+    };
+    defer client.read_buf.deinit();
+    defer client.write_buf.deinit(alloc);
+
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("first-attach-output");
+
+    const resize = ipc.Resize{ .rows = 24, .cols = 80 };
+    try daemon.handleInit(alloc, &client, -1, &term, std.mem.asBytes(&resize));
+
+    try std.testing.expect(std.mem.indexOf(u8, client.write_buf.items, "first-attach-output") != null);
 }
