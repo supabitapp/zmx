@@ -369,6 +369,7 @@ pub fn main(init: std.process.Init) !void {
                 error.OutOfMemory => return err,
             };
             const client_sock = try socket.sessionConnect(socket_path);
+            try ipc.send(client_sock, .Tail, "");
             try client_socket_fds.append(gpa, client_sock);
         }
         _ = try tail(gpa, client_socket_fds, false, false);
