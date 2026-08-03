@@ -8,4 +8,7 @@ comptime {
     _ = @import("loop.zig");
     _ = @import("cfg.zig");
     _ = @import("daemonize.zig");
+    _ = @import("continuation_test.zig");
+    _ = @import("live_test.zig");
+    _ = @import("terminal_replay.zig");
 }

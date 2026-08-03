@@ -5,6 +5,7 @@ const log = @import("log.zig");
 const util = @import("util.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
+const terminal_replay = @import("terminal_replay.zig");
 const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
 const Cfg = @import("cfg.zig");
@@ -12,6 +13,8 @@ const signal = @import("signal.zig");
 const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
+
+const terminal_continuation_max_bytes = 1024 * 1024;
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
@@ -43,7 +46,7 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
 
     // Send init message with terminal size (buffered)
     const size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-    try ipc.appendTerminalSizeMessages(gpa, &sock_write_buf, .Init, size);
+    try ipc.appendMessage(gpa, &sock_write_buf, .Init, std.mem.asBytes(&size));
 
     var poll_fds = try std.ArrayList(lib_posix.pollfd).initCapacity(gpa, 4);
     defer poll_fds.deinit(gpa);
@@ -62,6 +65,8 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
     const stdin_orig_flags = try lib_posix.fcntl(stdin_fd, lib_posix.F.GETFL, 0);
     _ = try lib_posix.fcntl(stdin_fd, lib_posix.F.SETFL, stdin_orig_flags | lib_posix.O_NONBLOCK);
     defer _ = lib_posix.fcntl(stdin_fd, lib_posix.F.SETFL, stdin_orig_flags) catch {};
+
+    const detach_key_disabled = util.isDetachKeyDisabled();
 
     while (true) {
         poll_fds.clearRetainingCapacity();
@@ -98,7 +103,7 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
             const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-            try ipc.appendTerminalSizeMessages(gpa, &sock_write_buf, .Resize, next_size);
+            try ipc.appendMessage(gpa, &sock_write_buf, .Resize, std.mem.asBytes(&next_size));
         }
 
         // Handle stdin -> socket (Input)
@@ -113,7 +118,7 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
             if (n_opt) |n| {
                 if (n > 0) {
                     // Check for detach sequences (ctrl+\ as first byte or Kitty escape sequence)
-                    if (util.isCtrlBackslash(buf[0..n])) {
+                    if (!detach_key_disabled and util.isCtrlBackslash(buf[0..n])) {
                         std.log.info("detach key detected", .{});
                         try ipc.appendMessage(gpa, &sock_write_buf, .Detach, "");
                     } else {
@@ -154,16 +159,25 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
                         // daemon is asking for the client's window size usually in response
                         // to this client being set as leader.
                         const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-                        try ipc.appendTerminalSizeMessages(
+                        try ipc.appendMessage(
                             gpa,
                             &sock_write_buf,
                             .Resize,
-                            next_size,
+                            std.mem.asBytes(&next_size),
                         );
                     },
                     .Switch => {
                         std.log.info("switch session", .{});
-                        return ClientResult{ .kind = .switch_session, .session_name = try gpa.dupe(u8, msg.payload) };
+                        // Payload format: "session_name\ncwd" from the daemon
+                        const newline_idx = std.mem.indexOfScalar(u8, msg.payload, '\n') orelse {
+                            // No cwd provided (backward compat or old daemon)
+                            return ClientResult{ .kind = .switch_session, .session_name = try gpa.dupe(u8, msg.payload) };
+                        };
+                        return ClientResult{
+                            .kind = .switch_session,
+                            .session_name = try gpa.dupe(u8, msg.payload[0..newline_idx]),
+                            .cwd = if (newline_idx + 1 < msg.payload.len) try gpa.dupe(u8, msg.payload[newline_idx + 1 ..]) else null,
+                        };
                     },
                     else => {},
                 }
@@ -221,7 +235,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         .max_scrollback_lines = daemon.cfg.max_scrollback_lines,
     });
     defer term.deinit(gpa);
-    var vt_stream = term.vtStream();
+    var vt_stream = ghostty_vt.TerminalStream.init(.{
+        .allocator = gpa,
+        .handler = term.vtHandler(),
+        .continuation_max_bytes = terminal_continuation_max_bytes,
+    });
     defer vt_stream.deinit();
 
     // Carries the tail of the previous PTY read so the task-exit marker
@@ -301,119 +319,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 "client connected fd={d} total={d}",
                 .{ client_fd, daemon.clients.items.len },
             );
-        }
-
-        const inp_flags = lib_posix.POLL.IN | lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL;
-        if (poll_fds.items[1].revents & inp_flags != 0) {
-            // Read from PTY. Buffer is sized to N_TTY_BUF_SIZE (4096): the hard
-            // kernel limit for the N_TTY line discipline. A larger buffer doesn't
-            // help: each read() from a PTY master returns at most 4096 bytes
-            // regardless of the userspace buffer size.
-            var buf: [4096]u8 = undefined;
-            const n_opt: ?usize = lib_posix.read(pty_fd, &buf) catch |err| blk: {
-                if (err == error.WouldBlock) break :blk null;
-                break :blk 0;
-            };
-
-            if (n_opt) |n| {
-                if (n == 0) {
-                    // EOF: Shell exited
-                    std.log.info("shell exited pty_fd={d}", .{pty_fd});
-                    // Let the rest of this poll iteration complete so client
-                    // write buffers are flushed via the normal POLLOUT path.
-                    // On the next iteration, daemon.running will be false.
-                    daemon.running = false;
-                } else {
-                    // Feed PTY output to terminal emulator for state tracking
-                    vt_stream.nextSlice(buf[0..n]);
-                    daemon.has_pty_output = true;
-
-                    // When no real terminal client has attached yet, respond to
-                    // terminal queries (e.g. DA1/DA2) on behalf of the terminal.
-                    // This prevents fish from waiting 10s for unanswered queries.
-                    // `has_terminal_client` is only set when a client sends .Init
-                    // (a real zmx attach), not when a `zmx run` tail-only client
-                    // connects.
-                    if (!daemon.has_terminal_client and
-                        daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX)
-                    {
-                        util.respondToDeviceAttributes(gpa, &daemon.pty_write_buf, buf[0..n]);
-                    }
-
-                    // In run mode, scan output for exit code marker. The marker
-                    // can straddle two PTY reads (more likely under a throttled
-                    // scheduler, e.g. containers), so prepend the tail carried
-                    // over from the previous read before searching.
-                    if (daemon.is_task_mode and daemon.task_exit_code == null) {
-                        var scan_buf: [marker_carry.len + buf.len]u8 = undefined;
-                        @memcpy(scan_buf[0..marker_carry_len], marker_carry[0..marker_carry_len]);
-                        @memcpy(scan_buf[marker_carry_len..][0..n], buf[0..n]);
-                        const scan_len = marker_carry_len + n;
-
-                        if (util.findTaskExitMarker(scan_buf[0..scan_len])) |exit_code| {
-                            daemon.task_exit_code = exit_code;
-                            daemon.task_ended_at = @intCast(std.Io.Timestamp.now(io, .real).toSeconds());
-
-                            std.log.info("task completed exit_code={d}", .{exit_code});
-
-                            // Notify connected clients
-                            for (daemon.clients.items) |c| {
-                                ipc.appendMessage(gpa, &c.write_buf, .TaskComplete, &[_]u8{exit_code}) catch {};
-                                c.has_pending_output = true;
-                            }
-                        }
-
-                        marker_carry_len = @min(marker_carry.len, scan_len);
-                        @memcpy(
-                            marker_carry[0..marker_carry_len],
-                            scan_buf[scan_len - marker_carry_len .. scan_len],
-                        );
-                    }
-
-                    // Broadcast data to all clients.
-                    // Rewrite OSC 133;A to include redraw=0 so the outer terminal
-                    // does not clear prompt lines on resize (issue #111).
-                    const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
-                    defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
-                    for (daemon.clients.items) |client| {
-                        ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
-                            std.log.warn(
-                                "failed to buffer output for client err={s}",
-                                .{@errorName(err)},
-                            );
-                            continue;
-                        };
-                        client.has_pending_output = true;
-                    }
-                }
-            }
-        }
-
-        if (poll_fds.items[1].revents & lib_posix.POLL.OUT != 0) {
-            while (daemon.pty_write_buf.items.len > 0) {
-                const n = lib_posix.write(pty_fd, daemon.pty_write_buf.items) catch |err| {
-                    if (err != error.WouldBlock) {
-                        std.log.warn("pty write failed: {s}", .{@errorName(err)});
-                        daemon.pty_write_buf.clearRetainingCapacity();
-                    }
-                    break;
-                };
-                if (n == 0) break;
-                daemon.pty_write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
-            }
+            continue :daemon_loop;
         }
 
         var i: usize = daemon.clients.items.len;
-        // Only iterate over clients that were present when poll_fds was constructed
-        // poll_fds contains [server, pty, sig_pipe, client0, client1, ...]
-        // So number of clients in poll_fds is poll_fds.items.len - 3
-        const num_polled_clients = poll_fds.items.len - 3;
-        if (i > num_polled_clients) {
-            // If we have more clients than polled (i.e. we just accepted one), start from the
-            // polled ones
-            i = num_polled_clients;
-        }
-
         clients_loop: while (i > 0) {
             i -= 1;
             const client = daemon.clients.items[i];
@@ -442,8 +351,8 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     switch (msg.header.tag) {
                         .Input => try daemon.handleInput(gpa, client, msg.payload),
                         .Send => daemon.handleSend(gpa, msg.payload),
-                        .Output => try daemon.handleOutput(gpa, msg.payload, &vt_stream),
-                        .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
+                        .Output => try daemon.handleOutput(msg.payload, &term, &vt_stream),
+                        .Init => try daemon.handleInit(gpa, client, pty_fd, &term, &vt_stream, msg.payload),
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
                         .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
                         .Detach => {
@@ -457,12 +366,13 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Kill => {
                             break :daemon_loop;
                         },
-                        .Info => try daemon.handleInfo(gpa, client),
+                        .Info => try daemon.handleInfo(gpa, client, &term),
                         .LabelGet => try daemon.handleLabelGet(gpa, client),
                         .LabelSet => try daemon.handleLabelSet(gpa, client, msg.payload),
                         .LabelClear => try daemon.handleLabelClear(gpa, client),
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
-                        .Run => try daemon.handleRun(gpa, client, msg.payload),
+                        .Run => try daemon.handleRun(gpa, io, client, msg.payload),
+                        .Tail => try daemon.handleTail(client),
                         .Ack, .TaskComplete, .LabelData => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => std.log.warn(
@@ -497,6 +407,106 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 if (last) break :daemon_loop;
             }
         }
+
+        const inp_flags = lib_posix.POLL.IN | lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL;
+        if (poll_fds.items[1].revents & inp_flags != 0) {
+            // Read from PTY. Buffer is sized to N_TTY_BUF_SIZE (4096): the hard
+            // kernel limit for the N_TTY line discipline. A larger buffer doesn't
+            // help: each read() from a PTY master returns at most 4096 bytes
+            // regardless of the userspace buffer size.
+            var buf: [4096]u8 = undefined;
+            const n_opt: ?usize = lib_posix.read(pty_fd, &buf) catch |err| blk: {
+                if (err == error.WouldBlock) break :blk null;
+                break :blk 0;
+            };
+
+            if (n_opt) |n| {
+                if (n == 0) {
+                    // EOF: Shell exited
+                    std.log.info("shell exited pty_fd={d}", .{pty_fd});
+                    // Let the rest of this poll iteration complete so client
+                    // write buffers are flushed via the normal POLLOUT path.
+                    // On the next iteration, daemon.running will be false.
+                    daemon.running = false;
+                } else {
+                    // Feed PTY output to terminal emulator for state tracking
+                    vt_stream.nextSlice(buf[0..n]);
+                    daemon.setPwd(&term);
+                    daemon.has_pty_output = true;
+
+                    // When no real terminal client has attached yet, respond to
+                    // terminal queries (e.g. DA1/DA2) on behalf of the terminal.
+                    // This prevents fish from waiting 10s for unanswered queries.
+                    // `has_terminal_client` is only set when a client sends .Init
+                    // (a real zmx attach), not when a `zmx run` tail-only client
+                    // connects.
+                    if (!daemon.has_terminal_client and
+                        daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX)
+                    {
+                        util.respondToDeviceAttributes(gpa, &daemon.pty_write_buf, buf[0..n]);
+                    }
+
+                    // In run mode, scan output for exit code marker. The marker
+                    // can straddle two PTY reads (more likely under a throttled
+                    // scheduler, e.g. containers), so prepend the tail carried
+                    // over from the previous read before searching.
+                    if (daemon.is_task_mode and daemon.task_exit_code == null) {
+                        var scan_buf: [marker_carry.len + buf.len]u8 = undefined;
+                        @memcpy(scan_buf[0..marker_carry_len], marker_carry[0..marker_carry_len]);
+                        @memcpy(scan_buf[marker_carry_len..][0..n], buf[0..n]);
+                        const scan_len = marker_carry_len + n;
+
+                        if (try util.findTaskExitMarker(scan_buf[0..scan_len], daemon.task_id)) |exit_code| {
+                            daemon.task_exit_code = exit_code;
+                            daemon.task_ended_at = @intCast(std.Io.Timestamp.now(io, .real).toSeconds());
+
+                            std.log.info("task completed exit_code={d}", .{exit_code});
+
+                            // Notify connected clients
+                            for (daemon.clients.items) |c| {
+                                ipc.appendMessage(gpa, &c.write_buf, .TaskComplete, &[_]u8{exit_code}) catch {};
+                                c.has_pending_output = true;
+                            }
+                        }
+
+                        marker_carry_len = @min(marker_carry.len, scan_len);
+                        @memcpy(
+                            marker_carry[0..marker_carry_len],
+                            scan_buf[scan_len - marker_carry_len .. scan_len],
+                        );
+                    }
+
+                    // Broadcast data to all clients.
+                    // Rewrite OSC 133;A to include redraw=0 so the outer terminal
+                    // does not clear prompt lines on resize (issue #111).
+                    const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
+                    defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
+                    for (daemon.clients.items) |client| {
+                        client.appendOutput(broadcast_data) catch |err| {
+                            std.log.warn(
+                                "failed to buffer output for client err={s}",
+                                .{@errorName(err)},
+                            );
+                            continue;
+                        };
+                    }
+                }
+            }
+        }
+
+        if (poll_fds.items[1].revents & lib_posix.POLL.OUT != 0) {
+            while (daemon.pty_write_buf.items.len > 0) {
+                const n = lib_posix.write(pty_fd, daemon.pty_write_buf.items) catch |err| {
+                    if (err != error.WouldBlock) {
+                        std.log.warn("pty write failed: {s}", .{@errorName(err)});
+                        daemon.pty_write_buf.clearRetainingCapacity();
+                    }
+                    break;
+                };
+                if (n == 0) break;
+                daemon.pty_write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
+            }
+        }
     }
 }
 
@@ -506,6 +516,7 @@ const ClientResult = struct {
         switch_session,
     },
     session_name: ?[]const u8,
+    cwd: ?[]const u8 = null,
 };
 
 /// Client represents each terminal that has connected to a session.
@@ -515,6 +526,7 @@ pub const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
     has_pending_output: bool = false,
+    receives_pty_output: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
 
@@ -522,6 +534,12 @@ pub const Client = struct {
         lib_posix.close(self.socket_fd);
         self.read_buf.deinit();
         self.write_buf.deinit(self.alloc);
+    }
+
+    fn appendOutput(self: *Client, payload: []const u8) !void {
+        if (!self.receives_pty_output) return;
+        try ipc.appendMessage(self.alloc, &self.write_buf, .Output, payload);
+        self.has_pending_output = true;
     }
 };
 
@@ -547,12 +565,24 @@ pub const Daemon = struct {
     running: bool = true,
     pid: i32 = undefined,
     command: ?[]const []const u8 = null,
+    /// The session's working directory in OSC 7 form, `file://<host><path>`.
+    /// Kept as a URI rather than a path so `zmx list` shows the host, which is
+    /// what tells you a session is inside SSH. Points into `cwd_buf` once set,
+    /// so a Daemon must not be copied by value after that.
     cwd: []const u8 = "",
+    /// The same directory as a path that can be opened: percent-decoding
+    /// applied, scheme and host stripped. Empty when the cwd is on another
+    /// host, since then it names no directory here and nothing should chdir
+    /// into it. Points into `cwd_path_buf`.
+    cwd_path: []const u8 = "",
+    cwd_buf: [std.fs.max_path_bytes]u8 = undefined,
+    cwd_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     has_pty_output: bool = false,
     has_had_client: bool = false,
     has_terminal_client: bool = false, // true only after a real attach (.Init received)
     created_at: u64, // unix timestamp (ns)
     is_task_mode: bool = false, // flag for when session is run as a task
+    task_id: [4]u8 = undefined,
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
@@ -676,6 +706,23 @@ pub const Daemon = struct {
 
         var keep_fds_open = [_]i32{ server_sock_fd, dir.handle, log_fd };
         const cmd = try daemonize.createCmdZ(self.shell, self.is_task_mode, self.command);
+
+        // `cwd_path` is the decoded path, and is empty when the cwd is on
+        // another host: OSC 7 crosses SSH boundaries, so a session that ssh'd
+        // elsewhere reports a directory that does not exist on this machine.
+        std.log.info("checking pwd={s} path={s}", .{ self.cwd, self.cwd_path });
+        if (self.cwd_path.len > 0) {
+            const pwd_dir = std.Io.Dir.openDirAbsolute(io, self.cwd_path, .{}) catch |err| blk: {
+                std.log.warn("failed to open dir={s} err={s}", .{ self.cwd_path, @errorName(err) });
+                break :blk null;
+            };
+            if (pwd_dir) |pdir| {
+                defer std.Io.Dir.close(pdir, io);
+                std.log.info("set directory dir={s}", .{self.cwd_path});
+                try std.process.setCurrentDir(io, pdir);
+            }
+        }
+
         const pty_info = daemonize.daemonize(
             sesh_name,
             cmd,
@@ -786,7 +833,10 @@ pub const Daemon = struct {
             );
             return;
         }
-        std.log.debug("buffering pty input data={x}", .{data});
+
+        // NOTE: for local dev only
+        // std.log.debug("buffering pty input data={x}", .{data});
+
         self.pty_write_buf.appendSlice(gpa, data) catch |err| {
             std.log.warn(
                 "pty input dropped {d} bytes: {s}",
@@ -796,7 +846,9 @@ pub const Daemon = struct {
     }
 
     pub fn handleInput(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
-        std.log.debug("buffering pty input data={x}", .{payload});
+        // NOTE: for local dev only
+        // std.log.debug("buffering pty input data={x}", .{payload});
+
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
             self.queuePtyInput(gpa, payload);
@@ -815,20 +867,39 @@ pub const Daemon = struct {
         self.queuePtyInput(gpa, payload);
     }
 
+    pub fn handleTail(_: *Daemon, client: *Client) !void {
+        client.receives_pty_output = true;
+        try ipc.appendMessage(client.alloc, &client.write_buf, .Ack, "");
+        client.has_pending_output = true;
+    }
+
     pub fn handleSwitch(self: *Daemon, gpa: std.mem.Allocator, session_name: []const u8) !void {
         for (self.clients.items) |client| {
             if (self.leader_client_fd == client.socket_fd) {
-                ipc.appendMessage(
-                    gpa,
-                    &client.write_buf,
-                    .Switch,
-                    session_name,
-                ) catch |err| {
-                    std.log.warn(
-                        "failed to buffer terminal state for client err={s}",
-                        .{@errorName(err)},
-                    );
-                };
+                // Include the daemon's current cwd so the new session can start
+                // in the right directory. A remote cwd is left out: it names no
+                // directory here, so the new session is better off with the
+                // attaching client's own cwd than with a path it cannot enter.
+                if (self.cwd.len > 0 and self.cwd_path.len > 0) {
+                    var payload = gpa.alloc(u8, session_name.len + 1 + self.cwd.len) catch return;
+                    defer gpa.free(payload);
+                    @memcpy(payload[0..session_name.len], session_name);
+                    payload[session_name.len] = '\n';
+                    @memcpy(payload[session_name.len + 1 ..], self.cwd);
+                    ipc.appendMessage(gpa, &client.write_buf, .Switch, payload) catch |err| {
+                        std.log.warn(
+                            "failed to buffer terminal state for client err={s}",
+                            .{@errorName(err)},
+                        );
+                    };
+                } else {
+                    ipc.appendMessage(gpa, &client.write_buf, .Switch, session_name) catch |err| {
+                        std.log.warn(
+                            "failed to buffer terminal state for client err={s}",
+                            .{@errorName(err)},
+                        );
+                    };
+                }
                 client.has_pending_output = true;
                 return;
             }
@@ -842,6 +913,7 @@ pub const Daemon = struct {
         client: *Client,
         pty_fd: i32,
         term: *ghostty_vt.Terminal,
+        vt_stream: *ghostty_vt.TerminalStream,
         payload: []const u8,
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
@@ -855,22 +927,12 @@ pub const Daemon = struct {
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
                 .{ cursor.x, cursor.y, cursor.pending_wrap },
             );
-            if (util.serializeTerminalState(gpa, term)) |term_output| {
-                std.log.debug("serialize terminal state", .{});
-                // Rewrite OSC 133;A to include redraw=0 so the outer terminal
-                // does not clear prompt lines on resize (issue #111).
-                const restore_data = util.rewritePromptRedraw(gpa, term_output) orelse term_output;
-                defer gpa.free(term_output);
-                defer if (restore_data.ptr != term_output.ptr) gpa.free(restore_data);
-                ipc.appendMessage(gpa, &client.write_buf, .Output, restore_data) catch |err| {
-                    std.log.warn(
-                        "failed to buffer terminal state for client err={s}",
-                        .{@errorName(err)},
-                    );
-                };
-                client.has_pending_output = true;
-            }
+            const output_len = client.write_buf.items.len;
+            terminal_replay.append(client.alloc, &client.write_buf, term, vt_stream);
+            client.has_pending_output = client.has_pending_output or client.write_buf.items.len > output_len;
         }
+
+        client.receives_pty_output = true;
 
         // no leader is set so set one
         if (self.leader_client_fd == null) {
@@ -974,7 +1036,9 @@ pub const Daemon = struct {
         };
     }
 
-    pub fn handleInfo(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+    pub fn handleInfo(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal) !void {
+        self.setPwd(term);
+
         // zeroes() so asBytes() doesn't ship struct padding + unused cmd/cwd
         // tail bytes (daemon stack contents) to clients.
         var info = std.mem.zeroes(ipc.Info);
@@ -1023,12 +1087,13 @@ pub const Daemon = struct {
     }
 
     pub fn handleHistory(
-        _: *Daemon,
+        self: *Daemon,
         gpa: std.mem.Allocator,
         client: *Client,
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
+        self.setPwd(term);
         const format: util.HistoryFormat = if (payload.len > 0)
             @enumFromInt(payload[0])
         else
@@ -1043,15 +1108,18 @@ pub const Daemon = struct {
         }
     }
 
-    pub fn handleRun(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+    pub fn handleRun(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client, payload: []const u8) !void {
         // Reset task tracking so the new command's exit marker is detected.
         // Without this, a second `zmx run` on the same session is ignored
         // because task_exit_code is still set from the first run.
         self.task_exit_code = null;
         self.task_ended_at = null;
         self.is_task_mode = true;
+        self.task_id = util.generateTaskId(io);
 
         if (payload.len == 0) return;
+
+        client.receives_pty_output = true;
 
         const cmd = payload;
 
@@ -1059,8 +1127,12 @@ pub const Daemon = struct {
         // exit code of the command (not the `;`). The sole exception is when
         // the command contains a heredoc (`<<`), the delimiter must be alone
         // on its line, so the marker goes on the next line instead.
-        const single_line_marker = "; echo ZMX_TASK_COMPLETED:$?\r";
-        const heredoc_marker = "\r\necho ZMX_TASK_COMPLETED:$?\r";
+        var buf: [1024]u8 = undefined;
+        const marker = try util.getTaskExitMarker(&buf, self.task_id);
+        var single_buf: [1024]u8 = undefined;
+        const single_line_marker = try std.fmt.bufPrint(&single_buf, "; echo {s}$?\r", .{marker});
+        var here_buf: [1024]u8 = undefined;
+        const heredoc_marker = try std.fmt.bufPrint(&here_buf, "\r\necho {s}$?\r", .{marker});
         const uses_heredoc = std.mem.indexOf(u8, cmd, "<<") != null;
 
         if (cmd.len > 0 and cmd[cmd.len - 1] == '\r') {
@@ -1076,12 +1148,56 @@ pub const Daemon = struct {
         std.log.debug("run command len={d}", .{payload.len});
     }
 
-    pub fn handleOutput(self: *Daemon, gpa: std.mem.Allocator, payload: []const u8, vt_stream: anytype) !void {
+    /// Store the session's working directory as a plain path.
+    ///
+    /// Accepts either an OSC 7 value (`file://<host><path>`, percent-encoded)
+    /// or a path. Decoding here rather than at each use keeps `zmx list`
+    /// printing a path and lets the chdir on session create find directories
+    /// whose names needed escaping.
+    ///
+    /// The value is copied, so callers may pass a temporary.
+    pub fn setCwd(self: *Daemon, value: []const u8) void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        const hostname = std.posix.gethostname(&host_buf) catch "";
+        const cwd = util.parseOsc7Cwd(&buf, value, hostname) orelse {
+            std.log.warn("ignoring unusable cwd={s}", .{value});
+            return;
+        };
+
+        // Store the URI form. A caller that handed us a plain path gets one
+        // built here, so `cwd` has the same shape no matter the source. A value
+        // that already was a URI is kept verbatim, so `list` shows what the
+        // shell actually reported.
+        self.cwd = if (std.fs.path.isAbsolute(value))
+            util.toOsc7Cwd(&self.cwd_buf, value, hostname) orelse return
+        else blk: {
+            if (value.len > self.cwd_buf.len) return;
+            @memcpy(self.cwd_buf[0..value.len], value);
+            break :blk self.cwd_buf[0..value.len];
+        };
+
+        // Only keep an openable path when it names a directory on this host.
+        if (cwd.is_local and cwd.path.len <= self.cwd_path_buf.len) {
+            @memcpy(self.cwd_path_buf[0..cwd.path.len], cwd.path);
+            self.cwd_path = self.cwd_path_buf[0..cwd.path.len];
+        } else {
+            self.cwd_path = "";
+        }
+        std.log.info("set cwd={s} path={s}", .{ self.cwd, self.cwd_path });
+    }
+
+    fn setPwd(self: *Daemon, term: *ghostty_vt.Terminal) void {
+        const pwd = term.getPwd() orelse return;
+        self.setCwd(pwd);
+    }
+
+    pub fn handleOutput(self: *Daemon, payload: []const u8, term: *ghostty_vt.Terminal, vt_stream: anytype) !void {
         vt_stream.nextSlice(payload);
+        self.setPwd(term);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
-            try ipc.appendMessage(gpa, &client.write_buf, .Output, payload);
-            client.has_pending_output = true;
+            try client.appendOutput(payload);
         }
         if (self.clients.items.len > 0) {
             lib_posix.kill(self.pid, lib_posix.SIG.WINCH) catch |err| {
@@ -1189,6 +1305,22 @@ pub const Daemon = struct {
     }
 };
 
+pub const testing = if (builtin.is_test) struct {
+    pub fn appendOutput(client: *Client, payload: []const u8) !void {
+        try client.appendOutput(payload);
+    }
+
+    pub fn runDaemonLoop(
+        daemon: *Daemon,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        server_sock_fd: lib_posix.socket_t,
+        pty_fd: i32,
+    ) !void {
+        try daemonLoop(daemon, gpa, io, server_sock_fd, pty_fd);
+    }
+} else struct {};
+
 test "send queues PTY input without changing leader" {
     const alloc = std.testing.allocator;
     var daemon = Daemon{
@@ -1234,12 +1366,16 @@ test "first attach replays explicit command output" {
         .rows = 24,
     });
     defer term.deinit(alloc);
-    var stream = term.vtStream();
+    var stream = ghostty_vt.TerminalStream.init(.{
+        .allocator = alloc,
+        .handler = term.vtHandler(),
+        .continuation_max_bytes = 1024,
+    });
     defer stream.deinit();
     stream.nextSlice("first-attach-output");
 
     const resize = ipc.Resize{ .rows = 24, .cols = 80 };
-    try daemon.handleInit(alloc, &client, -1, &term, std.mem.asBytes(&resize));
+    try daemon.handleInit(alloc, &client, -1, &term, &stream, std.mem.asBytes(&resize));
 
     try std.testing.expect(std.mem.indexOf(u8, client.write_buf.items, "first-attach-output") != null);
 }
