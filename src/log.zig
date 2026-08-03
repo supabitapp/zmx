@@ -35,11 +35,6 @@ pub const LogSystem = struct {
             else => return err,
         };
 
-        // Use lseek(SEEK_END) instead of length() + seekTo() to avoid a
-        // TOCTOU race: after fork() the parent may still write to the log
-        // between our length() check and seekTo(), causing us to overwrite
-        // recent parent entries. lseek(fd, 0, SEEK_END) is atomic — it
-        // always positions at the true end of file at seek time.
         const new_pos = cross.c.lseek(file.handle, 0, cross.c.SEEK_END);
         if (new_pos == -1) {
             std.Io.File.close(file, self.io);

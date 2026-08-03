@@ -23,6 +23,7 @@ pub const Tag = enum(u8) {
     LabelClear = 16,
     LabelData = 17,
     Send = 18,
+    Tail = 19,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -45,11 +46,6 @@ pub const Resize = packed struct {
     cols: u16,
     xpixel: u16 = 0,
     ypixel: u16 = 0,
-};
-
-const GridResize = packed struct {
-    rows: u16,
-    cols: u16,
 };
 
 pub fn getTerminalSize(fd: i32) Resize {
@@ -128,20 +124,6 @@ pub fn appendMessage(
     if (data.len > 0) {
         list.appendSliceAssumeCapacity(data);
     }
-}
-
-pub fn appendTerminalSizeMessages(
-    gpa: std.mem.Allocator,
-    list: *std.ArrayList(u8),
-    tag: Tag,
-    resize: Resize,
-) !void {
-    const grid_resize = GridResize{
-        .rows = resize.rows,
-        .cols = resize.cols,
-    };
-    try appendMessage(gpa, list, tag, std.mem.asBytes(&grid_resize));
-    try appendMessage(gpa, list, tag, std.mem.asBytes(&resize));
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
@@ -339,38 +321,8 @@ test "Tag wire values are frozen" {
         .{ Tag.Run, 9 },       .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
         .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
         .{ Tag.LabelSet, 15 }, .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
-        .{ Tag.Send, 18 },
+        .{ Tag.Send, 18 },     .{ Tag.Tail, 19 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
-}
-
-test "terminal size messages cover both rolling wire shapes" {
-    const alloc = std.testing.allocator;
-    const resize = Resize{
-        .rows = 48,
-        .cols = 160,
-        .xpixel = 1_920,
-        .ypixel = 1_080,
-    };
-    var bytes = std.ArrayList(u8).empty;
-    defer bytes.deinit(alloc);
-    try appendTerminalSizeMessages(alloc, &bytes, .Init, resize);
-
-    var messages = try SocketBuffer.init(alloc);
-    defer messages.deinit();
-    try messages.buf.appendSlice(alloc, bytes.items);
-
-    const grid_message = messages.next().?;
-    try std.testing.expectEqual(Tag.Init, grid_message.header.tag);
-    try std.testing.expectEqual(@sizeOf(GridResize), grid_message.payload.len);
-    const grid_resize = std.mem.bytesToValue(GridResize, grid_message.payload);
-    try std.testing.expectEqual(resize.rows, grid_resize.rows);
-    try std.testing.expectEqual(resize.cols, grid_resize.cols);
-
-    const pixel_message = messages.next().?;
-    try std.testing.expectEqual(Tag.Init, pixel_message.header.tag);
-    try std.testing.expectEqual(@sizeOf(Resize), pixel_message.payload.len);
-    try std.testing.expectEqual(resize, std.mem.bytesToValue(Resize, pixel_message.payload));
-    try std.testing.expect(messages.next() == null);
 }
 
 pub fn roundTripForTag(
