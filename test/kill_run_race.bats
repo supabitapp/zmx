@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Regression test for the `zmx kill X; zmx run X` race.
+# Regression tests for the `zmx kill X; zmx run X` race.
 #
 # Previously `zmx kill` returned immediately after sending the IPC .Kill,
 # while the daemon's shutdown defer ran handleKill() -- SIGHUP, 500ms sleep,
@@ -8,6 +8,10 @@
 # socket the daemon would never accept() on again, then get RST'd
 # (ConnectionResetByPeer) when the daemon finally closed the listen fd,
 # exiting 1 with no output and no session created.
+#
+# The daemon now unlinks its socket last, after reaping the pty child, so a
+# replacement session can be up and serving while the old daemon is still
+# working through that grace sleep.
 
 load test_helper
 
@@ -32,4 +36,25 @@ load test_helper
 
     "$ZMX" kill race-x
   done
+}
+
+@test "replacement session survives the dying daemon's shutdown" {
+  "$ZMX" run race-y -d echo first
+  wait_for_session race-y
+
+  "$ZMX" kill race-y
+  run "$ZMX" run race-y -d echo second
+  [ "$status" -eq 0 ]
+  wait_for_session race-y
+
+  # Outlast handleKill's 500ms SIGHUP->SIGKILL grace sleep. The old daemon
+  # unlinks its socket after that; it must leave the replacement's file alone.
+  sleep 1.5
+
+  run "$ZMX" list --short
+  [[ "$output" == *"race-y"* ]]
+  run "$ZMX" history race-y
+  [ "$status" -eq 0 ]
+
+  "$ZMX" kill race-y
 }

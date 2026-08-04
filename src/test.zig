@@ -10,5 +10,6 @@ comptime {
     _ = @import("daemonize.zig");
     _ = @import("continuation_test.zig");
     _ = @import("live_test.zig");
+    _ = @import("shutdown_test.zig");
     _ = @import("terminal_replay.zig");
 }

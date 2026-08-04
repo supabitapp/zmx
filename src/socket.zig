@@ -81,6 +81,35 @@ pub fn cleanupStaleSocket(io: std.Io, dir: std.Io.Dir, session_name: []const u8)
     };
 }
 
+/// Unlink a session socket only while it is still the file `inode` names.
+/// A daemon unlinks its own socket last, long after it stopped listening, so
+/// a replacement daemon may already own the name by then; deleting that file
+/// would hide a live session from every observer.
+pub fn deleteOwnedSocket(
+    io: std.Io,
+    dir: std.Io.Dir,
+    session_name: []const u8,
+    inode: std.Io.File.INode,
+) void {
+    const stat = dir.statFile(io, session_name, .{}) catch |err| {
+        std.log.warn("failed to stat socket file err={s}", .{@errorName(err)});
+        return;
+    };
+    if (stat.inode != inode) {
+        std.log.info("socket file belongs to another session={s}", .{session_name});
+        return;
+    }
+    std.log.info("deleting socket file session={s}", .{session_name});
+    dir.deleteFile(io, session_name) catch |err| {
+        std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
+    };
+}
+
+pub fn socketInode(io: std.Io, dir: std.Io.Dir, name: []const u8) !std.Io.File.INode {
+    const stat = try dir.statFile(io, name, .{});
+    return stat.inode;
+}
+
 pub fn sessionExists(io: std.Io, dir: std.Io.Dir, name: []const u8) !bool {
     const stat = dir.statFile(io, name, std.Io.Dir.StatFileOptions{}) catch |err| {
         switch (err) {
