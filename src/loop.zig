@@ -702,6 +702,7 @@ pub const Daemon = struct {
     fn run(self: *Daemon, io: std.Io, dir: std.Io.Dir, sesh_name: []const u8) !bool {
         std.log.info("creating session={s}", .{sesh_name});
         const server_sock_fd: lib_posix.socket_t = try socket.createSocket(self.socket_path);
+        const socket_inode = try socket.socketInode(io, dir, sesh_name);
         const log_fd = log.log_system.file.?.handle;
 
         var keep_fds_open = [_]i32{ server_sock_fd, dir.handle, log_fd };
@@ -787,25 +788,39 @@ pub const Daemon = struct {
             break :blk std.heap.c_allocator;
         };
 
-        defer {
-            // Close and unlink the listen socket BEFORE handleKill()'s
-            // 500ms SIGHUP->SIGKILL grace sleep. Otherwise a `zmx run`
-            // for the same name issued in that window will hang waiting
-            // for a connect.
-            lib_posix.close(server_sock_fd);
-            std.log.info("deleting socket file session={s}", .{sesh_name});
-            dir.deleteFile(new_io, sesh_name) catch |err| {
-                std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
-            };
-            self.handleKill(gpa, new_io);
-            self.deinit(gpa);
-            lib_posix.close(pty_info.master_fd);
-            _ = lib_posix.waitpid(self.pid, 0);
-        }
+        defer self.shutdownSession(gpa, new_io, dir, server_sock_fd, pty_info.master_fd, socket_inode);
 
         try daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd);
         std.log.info("daemon loop shutdown", .{});
         return true;
+    }
+
+    /// Tears the session down in the one order observers can survive.
+    ///
+    /// The socket file is the only trace of a session anyone can see: `zmx ls`
+    /// enumerates the socket directory. So it goes last, after the pty child is
+    /// reaped, and a shutdown that stalls stays visible and killable instead of
+    /// leaving an orphan nobody can name.
+    ///
+    /// Closing the listen fd first is what keeps a concurrent `zmx run <name>`
+    /// from hanging: connecting to a bound socket with no listener is refused
+    /// at once, and ensureSession takes ConnectionRefused as a dead daemon.
+    fn shutdownSession(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        server_sock_fd: lib_posix.socket_t,
+        master_fd: i32,
+        socket_inode: std.Io.File.INode,
+    ) void {
+        lib_posix.close(server_sock_fd);
+        self.handleKill(gpa, io);
+        const session_name = self.session_name;
+        self.deinit(gpa);
+        lib_posix.close(master_fd);
+        _ = lib_posix.waitpid(self.pid, 0);
+        socket.deleteOwnedSocket(io, dir, session_name, socket_inode);
     }
 
     fn setLeader(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
@@ -1318,6 +1333,18 @@ pub const testing = if (builtin.is_test) struct {
         pty_fd: i32,
     ) !void {
         try daemonLoop(daemon, gpa, io, server_sock_fd, pty_fd);
+    }
+
+    pub fn shutdownSession(
+        daemon: *Daemon,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        server_sock_fd: lib_posix.socket_t,
+        master_fd: i32,
+        socket_inode: std.Io.File.INode,
+    ) void {
+        daemon.shutdownSession(gpa, io, dir, server_sock_fd, master_fd, socket_inode);
     }
 } else struct {};
 
