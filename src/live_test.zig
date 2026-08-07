@@ -1,5 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const ghostty_vt = @import("ghostty-vt");
+const continuation_cases = @import("continuation_cases.zig");
+const continuation_test = @import("continuation_test.zig");
 const cross = @import("cross.zig");
 const ipc = @import("ipc.zig");
 const lib_posix = @import("posix.zig");
@@ -200,10 +203,88 @@ fn readTag(buffer: *ipc.SocketBuffer, socket_fd: i32, tag: ipc.Tag) ![]const u8 
     }
 }
 
-test "live attach preserves split sequence across PTY and socket boundaries" {
+const AttachedTerminal = struct {
+    alloc: std.mem.Allocator,
+    socket_fd: i32,
+    buffer: ipc.SocketBuffer,
+    terminal: ghostty_vt.Terminal,
+    stream: ghostty_vt.TerminalStream,
+
+    fn create(
+        alloc: std.mem.Allocator,
+        daemon: *LiveDaemon,
+        resize: ipc.Resize,
+    ) !*AttachedTerminal {
+        const self = try alloc.create(AttachedTerminal);
+        errdefer alloc.destroy(self);
+        self.alloc = alloc;
+        self.socket_fd = try daemon.connect();
+        errdefer lib_posix.close(self.socket_fd);
+        self.buffer = try ipc.SocketBuffer.init(alloc);
+        errdefer self.buffer.deinit();
+        self.terminal = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{
+            .cols = resize.cols,
+            .rows = resize.rows,
+        });
+        errdefer self.terminal.deinit(alloc);
+        self.stream = self.terminal.vtStream();
+        errdefer self.stream.deinit();
+
+        try ipc.send(self.socket_fd, .Init, std.mem.asBytes(&resize));
+        self.stream.nextSlice(try readTag(&self.buffer, self.socket_fd, .Output));
+        self.stream.nextSlice(try readTag(&self.buffer, self.socket_fd, .Output));
+        return self;
+    }
+
+    fn destroy(self: *AttachedTerminal) void {
+        self.stream.deinit();
+        self.terminal.deinit(self.alloc);
+        self.buffer.deinit();
+        lib_posix.close(self.socket_fd);
+        self.alloc.destroy(self);
+    }
+
+    fn readOutput(self: *AttachedTerminal) ![]const u8 {
+        const output = try readTag(&self.buffer, self.socket_fd, .Output);
+        self.stream.nextSlice(output);
+        return output;
+    }
+};
+
+fn writeAndRead(
+    daemon: *LiveDaemon,
+    tail: *ipc.SocketBuffer,
+    tail_fd: i32,
+    attached: []const *AttachedTerminal,
+    bytes: []const u8,
+) !void {
+    try daemon.write(bytes);
+    try std.testing.expectEqualStrings(bytes, try readTag(tail, tail_fd, .Output));
+    for (attached) |client| {
+        try std.testing.expectEqualStrings(bytes, try client.readOutput());
+    }
+}
+
+fn writeBytewise(
+    daemon: *LiveDaemon,
+    tail: *ipc.SocketBuffer,
+    tail_fd: i32,
+    attached: []const *AttachedTerminal,
+    bytes: []const u8,
+) !void {
+    for (0..bytes.len) |index| {
+        try writeAndRead(
+            daemon,
+            tail,
+            tail_fd,
+            attached,
+            bytes[index .. index + 1],
+        );
+    }
+}
+
+fn runLiveCase(case: continuation_cases.Case) !void {
     const alloc = std.testing.allocator;
-    const prefix = "\x1b[31";
-    const suffix = "mX\x1b[0m";
     var daemon = try LiveDaemon.init(alloc);
     defer daemon.deinit();
 
@@ -212,9 +293,9 @@ test "live attach preserves split sequence across PTY and socket boundaries" {
     var tail = try ipc.SocketBuffer.init(alloc);
     defer tail.deinit();
     try ipc.send(tail_fd, .Tail, "");
-    try daemon.write("first");
+    try daemon.write(case.prefix);
     try daemon.start();
-    try std.testing.expectEqualStrings("first", try readTag(&tail, tail_fd, .Output));
+    try std.testing.expectEqualStrings(case.prefix, try readTag(&tail, tail_fd, .Output));
 
     const first_fd = try daemon.connect();
     defer lib_posix.close(first_fd);
@@ -224,20 +305,39 @@ test "live attach preserves split sequence across PTY and socket boundaries" {
     try ipc.send(first_fd, .Init, std.mem.asBytes(&resize));
     _ = try readTag(&first, first_fd, .Resize);
 
-    try daemon.write(prefix);
-    try std.testing.expectEqualStrings(prefix, try readTag(&tail, tail_fd, .Output));
-    try std.testing.expectEqualStrings(prefix, try readTag(&first, first_fd, .Output));
+    const cut = case.sequence.len / 2;
+    try writeBytewise(&daemon, &tail, tail_fd, &.{}, case.sequence[0..cut]);
 
-    const second_fd = try daemon.connect();
-    defer lib_posix.close(second_fd);
-    var second = try ipc.SocketBuffer.init(alloc);
-    defer second.deinit();
-    try ipc.send(second_fd, .Init, std.mem.asBytes(&resize));
-    try std.testing.expect((try readTag(&second, second_fd, .Output)).len > 0);
-    try std.testing.expectEqualStrings(prefix, try readTag(&second, second_fd, .Output));
+    const second = try AttachedTerminal.create(alloc, &daemon, resize);
+    defer second.destroy();
+    const third = try AttachedTerminal.create(alloc, &daemon, resize);
+    defer third.destroy();
+    const attached = [_]*AttachedTerminal{ second, third };
 
-    try daemon.write(suffix);
-    try std.testing.expectEqualStrings(suffix, try readTag(&tail, tail_fd, .Output));
-    try std.testing.expectEqualStrings(suffix, try readTag(&second, second_fd, .Output));
-    try daemon.stop(second_fd);
+    try writeBytewise(&daemon, &tail, tail_fd, &attached, case.sequence[cut..]);
+    try writeBytewise(&daemon, &tail, tail_fd, &attached, case.suffix);
+
+    var uninterrupted = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{
+        .cols = resize.cols,
+        .rows = resize.rows,
+    });
+    defer uninterrupted.deinit(alloc);
+    var uninterrupted_stream = uninterrupted.vtStream();
+    defer uninterrupted_stream.deinit();
+    const input = try case.input(alloc);
+    defer alloc.free(input);
+    uninterrupted_stream.nextSlice(input);
+
+    try continuation_test.expectTerminalsEqual(alloc, &uninterrupted, &second.terminal);
+    try continuation_test.expectTerminalsEqual(alloc, &uninterrupted, &third.terminal);
+    try daemon.stop(third.socket_fd);
+}
+
+test "live repeated attach preserves continuation cases across byte boundaries" {
+    for (continuation_cases.all) |case| {
+        runLiveCase(case) catch |err| {
+            std.debug.print("live continuation case {s} failed\n", .{case.name});
+            return err;
+        };
+    }
 }
