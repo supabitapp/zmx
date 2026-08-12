@@ -119,9 +119,13 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(sesh);
         return history(gpa, io, &cfg, sesh, format);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
-        const session_name = args.next() orelse "";
+        var session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
             return help(io);
+        }
+        const existing_only = std.mem.eql(u8, session_name, "--existing");
+        if (existing_only) {
+            session_name = args.next() orelse "";
         }
 
         var command_args: std.ArrayList([]const u8) = .empty;
@@ -150,7 +154,7 @@ pub fn main(init: std.process.Init) !void {
         daemon.cwd = cwd;
         daemon.shell = shell_env;
         std.log.info("socket path={s}", .{daemon.socket_path});
-        return attach(gpa, io, &daemon);
+        return attach(gpa, io, &daemon, existing_only);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -412,7 +416,7 @@ fn help(io: std.Io) !void {
         \\Usage: zmx <command> [args...]
         \\
         \\Commands:
-        \\  [a]ttach <name> [command...]             Attach to session, creating if needed
+        \\  [a]ttach [--existing] <name> [command...] Attach to session; --existing forbids creation
         \\  [r]un <name> [-d] [command...]           Send command without attaching
         \\  [s]end <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
@@ -1286,16 +1290,27 @@ fn switchSesh(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, current_sesh:
     };
 }
 
-fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon) !void {
+fn connectExistingSession(socket_path: []const u8) !lib_posix.socket_t {
+    return socket.sessionConnect(socket_path) catch |err| switch (err) {
+        error.FileNotFound, error.ConnectionRefused => error.SessionNotFound,
+        else => return err,
+    };
+}
+
+fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, existing_only: bool) !void {
     const sesh = socket.getSeshNameFromEnv();
     if (sesh.len > 0) {
+        if (existing_only) return error.SessionSwitchCannotRequireExisting;
         return switchSesh(gpa, io, daemon, sesh);
     }
 
-    const is_daemon_proc = try daemon.ensureSession(io);
-    if (is_daemon_proc) return;
-
-    const client_sock = try socket.sessionConnect(daemon.socket_path);
+    const client_sock = if (existing_only)
+        try connectExistingSession(daemon.socket_path)
+    else session: {
+        const is_daemon_proc = try daemon.ensureSession(io);
+        if (is_daemon_proc) return;
+        break :session try socket.sessionConnect(daemon.socket_path);
+    };
     std.log.info("attached session={s}", .{daemon.session_name});
     //  This is typically used with tcsetattr() to modify terminal settings.
     //      - you first get the current settings with tcgetattr()
@@ -1371,10 +1386,31 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon) !void {
                 var target_daemon = Daemon.init(io, daemon.cfg, session_name, target_path);
                 target_daemon.cwd = cwd;
                 target_daemon.shell = daemon.shell;
-                return attach(gpa, io, &target_daemon);
+                return attach(gpa, io, &target_daemon, false);
             }
         },
     }
+}
+
+test "existing-only connection never creates a session" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const session_name = try std.fmt.allocPrint(alloc, "zmx-existing-{d}", .{std.c.getpid()});
+    defer alloc.free(session_name);
+    const socket_path = try std.fmt.allocPrint(alloc, "/tmp/{s}", .{session_name});
+    defer alloc.free(socket_path);
+    var dir = try std.Io.Dir.openDirAbsolute(io, "/tmp", .{});
+    defer dir.close(io);
+    dir.deleteFile(io, session_name) catch {};
+
+    try std.testing.expectError(error.SessionNotFound, connectExistingSession(socket_path));
+    try std.testing.expect(!try socket.sessionExists(io, dir, session_name));
+
+    const server_fd = try socket.createSocket(socket_path);
+    defer lib_posix.close(server_fd);
+    defer dir.deleteFile(io, session_name) catch {};
+    const client_fd = try connectExistingSession(socket_path);
+    lib_posix.close(client_fd);
 }
 
 fn writeFile(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, file_path: []const u8) !void {
