@@ -1389,7 +1389,7 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, existing_only: bo
                 std.log.info("switching to new session cwd={s}", .{switch_cwd});
                 target_daemon.setCwd(switch_cwd);
                 target_daemon.shell = daemon.shell;
-                return attach(gpa, io, &target_daemon, false);
+                return attach(gpa, io, &target_daemon, existing_only);
             }
         },
     }
