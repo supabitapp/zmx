@@ -936,7 +936,7 @@ fn execvpeZ_expandArg0(
     // Use of PATH_MAX here is valid as the path_buf will be passed
     // directly to the operating system in execveZ.
     var path_buf: [PATH_MAX]u8 = undefined;
-    var it = mem.tokenizeScalar(u8, PATH, ':');
+    var it = mem.splitScalar(u8, PATH, ':');
     var seen_eacces = false;
     var err: ExecveError = error.FileNotFound;
 
@@ -948,11 +948,12 @@ fn execvpeZ_expandArg0(
     };
 
     while (it.next()) |search_path| {
-        const path_len = search_path.len + file_slice.len + 1;
+        const directory = if (search_path.len == 0) "." else search_path;
+        const path_len = directory.len + file_slice.len + 1;
         if (path_buf.len < path_len + 1) return error.NameTooLong;
-        @memcpy(path_buf[0..search_path.len], search_path);
-        path_buf[search_path.len] = '/';
-        @memcpy(path_buf[search_path.len + 1 ..][0..file_slice.len], file_slice);
+        @memcpy(path_buf[0..directory.len], directory);
+        path_buf[directory.len] = '/';
+        @memcpy(path_buf[directory.len + 1 ..][0..file_slice.len], file_slice);
         path_buf[path_len] = 0;
         const full_path = path_buf[0..path_len :0].ptr;
         switch (arg0_expand) {

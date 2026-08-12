@@ -150,6 +150,22 @@ load test_helper
   [[ "$output" != *"existing-dst"* ]]
 }
 
+@test "attach: wrapped commands find the current directory through empty PATH entries" {
+  local command_name="zmx-path-command"
+  local command_path="$BATS_TEST_TMPDIR/$command_name"
+  printf '#!/bin/sh\nprintf "path-command-found\\n"\n/bin/sleep 1\n' >"$command_path"
+  chmod +x "$command_path"
+
+  local index=0
+  for search_path in ":/missing" "/missing::/also-missing"; do
+    run /bin/sh -c 'cd "$1" && PATH="$2" ZMX_SESSION= exec "$3" attach "$4" "$5"' \
+      sh "$BATS_TEST_TMPDIR" "$search_path" "$ZMX" "path-empty-$index" "$command_name"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"path-command-found"* ]]
+    ((index++)) || true
+  done
+}
+
 # ============================================================================
 # Send (raw PTY input)
 # ============================================================================
