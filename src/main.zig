@@ -1386,7 +1386,7 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, existing_only: bo
                 var target_daemon = Daemon.init(io, daemon.cfg, session_name, target_path);
                 target_daemon.cwd = cwd;
                 target_daemon.shell = daemon.shell;
-                return attach(gpa, io, &target_daemon, false);
+                return attach(gpa, io, &target_daemon, existing_only);
             }
         },
     }
