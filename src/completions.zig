@@ -40,7 +40,11 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    attach|run|send|print|write|kill|history|get|set|clear|wait|tail)
+    \\    attach)
+    \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
+    \\      COMPREPLY=($(compgen -W "--existing $sessions" -- "$cur"))
+    \\      ;;
+    \\    run|send|print|write|kill|history|get|set|clear|wait|tail)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -96,7 +100,10 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        attach|a|kill|k|run|r|send|s|print|p|write|wr|history|get|g|set|clear|hi|wait|w|tail|t)
+    \\        attach|a)
+    \\          _alternative 'options:option:(--existing)' 'sessions:session:_zmx_sessions'
+    \\          ;;
+    \\        kill|k|run|r|send|s|print|p|write|wr|history|get|g|set|clear|hi|wait|w|tail|t)
     \\          _zmx_sessions
     \\          ;;
     \\        completions|c)
@@ -162,6 +169,7 @@ const fish_completions =
     \\# Subcommand flags
     \\complete -c zmx -n "__fish_seen_subcommand_from r run" -s d -d 'Detach from the calling terminal; use `wait` to track its status'
     \\complete -c zmx -n "__fish_seen_subcommand_from r run" -l fish -d 'Required when the session runs fish shell'
+    \\complete -c zmx -n "__fish_seen_subcommand_from a attach" -l existing -d 'Attach only when the session exists'
     \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l short -d 'Short output'
     \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l where -d 'Filter by label (key=value)' -r
     \\complete -c zmx -n "__fish_seen_subcommand_from k kill" -l force -d 'Force kill'
@@ -179,6 +187,7 @@ const nu_completions =
     \\}
     \\
     \\export extern "zmx attach" [
+    \\    --existing
     \\    name: string@"nu-complete zmx sessions"
     \\    ...rest: string
     \\]

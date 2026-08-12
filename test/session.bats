@@ -77,6 +77,36 @@ load test_helper
   [[ "$output" != *"-h"* ]]
 }
 
+@test "attach --existing never creates a missing session" {
+  local marker="$BATS_TEST_TMPDIR/existing-marker"
+  run env ZMX_SESSION= "$ZMX" attach --existing test-missing /bin/sh -c "touch '$marker'"
+  [ "$status" -ne 0 ]
+  [ ! -e "$marker" ]
+
+  run "$ZMX" list --short
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"test-missing"* ]]
+}
+
+@test "attach --existing connects to a live session" {
+  "$ZMX" run test-existing -d /bin/sh -c "sleep 2"
+  wait_for_session test-existing
+
+  run env ZMX_SESSION= "$ZMX" attach --existing test-existing
+  [ "$status" -eq 0 ]
+}
+
+@test "attach --existing rejects session switching" {
+  local marker="$BATS_TEST_TMPDIR/existing-switch-marker"
+  run env ZMX_SESSION=current "$ZMX" attach --existing test-switch-missing /bin/sh -c "touch '$marker'"
+  [ "$status" -ne 0 ]
+  [ ! -e "$marker" ]
+
+  run "$ZMX" list --short
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"test-switch-missing"* ]]
+}
+
 # ============================================================================
 # Send (raw PTY input)
 # ============================================================================
