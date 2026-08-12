@@ -107,6 +107,49 @@ load test_helper
   [[ "$output" != *"test-switch-missing"* ]]
 }
 
+@test "attach --existing preserves strict mode after a live switch" {
+  "$ZMX" run existing-src -d /bin/sh
+  wait_for_session existing-src
+
+  local input="$BATS_TEST_TMPDIR/existing-input"
+  mkfifo "$input"
+  exec 9<>"$input"
+  env ZMX_SESSION= "$ZMX" attach --existing existing-src <"$input" \
+    >"$BATS_TEST_TMPDIR/existing-output" 2>"$BATS_TEST_TMPDIR/existing-error" &
+  local client_pid=$!
+  local attached=0
+  for _ in {1..50}; do
+    if "$ZMX" list | grep -Eq 'name=existing-src.*clients=1'; then
+      attached=1
+      break
+    fi
+    sleep 0.1
+  done
+  [ "$attached" -eq 1 ]
+
+  printf '%s\r' "$ZMX attach existing-dst" | "$ZMX" send existing-src
+  local exited=0
+  for _ in {1..50}; do
+    if ! kill -0 "$client_pid" 2>/dev/null; then
+      exited=1
+      break
+    fi
+    sleep 0.1
+  done
+  [ "$exited" -eq 1 ]
+
+  set +e
+  wait "$client_pid"
+  local client_status=$?
+  set -e
+  exec 9>&-
+  [ "$client_status" -ne 0 ]
+
+  run "$ZMX" list --short
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"existing-dst"* ]]
+}
+
 # ============================================================================
 # Send (raw PTY input)
 # ============================================================================
