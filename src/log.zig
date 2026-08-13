@@ -19,7 +19,7 @@ pub const LogSystem = struct {
     max_size: u64 = 2 * 1024 * 1024, // 2MB
     path: []const u8 = "",
     io: std.Io = undefined,
-    mode: std.Io.File.Permissions = std.Io.File.Permissions.fromMode(0o640),
+    mode: std.Io.File.Permissions = std.Io.File.Permissions.fromMode(0o600),
 
     pub fn init(self: *LogSystem, io: std.Io, path: []const u8, mode: std.Io.File.Permissions) !void {
         self.io = io;

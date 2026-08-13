@@ -10,8 +10,8 @@ const cross = @import("cross.zig");
 socket_dir: []const u8,
 log_dir: []const u8,
 max_scrollback_lines: usize = 2_000, // same default as tmux
-dir_mode: u32 = 0o750,
-log_mode: u32 = 0o640,
+dir_mode: u32 = 0o700,
+log_mode: u32 = 0o600,
 
 pub fn init(alloc: std.mem.Allocator, io: std.Io) !Cfg {
     const socket_dir = try socketDir(alloc);
@@ -20,14 +20,14 @@ pub fn init(alloc: std.mem.Allocator, io: std.Io) !Cfg {
     errdefer alloc.free(log_dir);
 
     const dir_mode = if (lib_posix.getenv("ZMX_DIR_MODE")) |m|
-        std.fmt.parseInt(u32, m, 8) catch 0o750
+        std.fmt.parseInt(u32, m, 8) catch 0o700
     else
-        0o750;
+        0o700;
 
     const log_mode = if (lib_posix.getenv("ZMX_LOG_MODE")) |m|
-        std.fmt.parseInt(u32, m, 8) catch 0o640
+        std.fmt.parseInt(u32, m, 8) catch 0o600
     else
-        0o640;
+        0o600;
 
     var cfg = Cfg{
         .socket_dir = socket_dir,
@@ -80,8 +80,16 @@ pub fn deinit(self: *Cfg, alloc: std.mem.Allocator) void {
 pub fn mkdir(self: *Cfg, io: std.Io) !void {
     const sock_perms = std.Io.Dir.Permissions.fromMode(@intCast(self.dir_mode));
     try mkdirAll(io, self.socket_dir, sock_perms);
+    try setDirPermissions(io, self.socket_dir, sock_perms);
     const log_perms = std.Io.Dir.Permissions.fromMode(@intCast(self.dir_mode));
     try mkdirAll(io, self.log_dir, log_perms);
+    try setDirPermissions(io, self.log_dir, log_perms);
+}
+
+fn setDirPermissions(io: std.Io, path: []const u8, permissions: std.Io.Dir.Permissions) !void {
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    try dir.setPermissions(io, permissions);
 }
 
 fn mkdirAll(io: std.Io, sub_dir_path: []const u8, permissions: std.Io.Dir.Permissions) !void {
@@ -110,8 +118,8 @@ test "Cfg.init uses default modes when env vars are not set" {
     var cfg = try Cfg.init(alloc, std.testing.io);
     defer cfg.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u32, 0o750), cfg.dir_mode);
-    try std.testing.expectEqual(@as(u32, 0o640), cfg.log_mode);
+    try std.testing.expectEqual(@as(u32, 0o700), cfg.dir_mode);
+    try std.testing.expectEqual(@as(u32, 0o600), cfg.log_mode);
 }
 
 test "Cfg.init uses custom modes from env vars" {

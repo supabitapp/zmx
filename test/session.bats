@@ -98,17 +98,17 @@ load test_helper
 
 @test "attach --existing rejects session switching" {
   local marker="$BATS_TEST_TMPDIR/existing-switch-marker"
-  run env ZMX_SESSION=current "$ZMX" attach --existing test-switch-missing /bin/sh -c "touch '$marker'"
+  run env ZMX_SESSION=current "$ZMX" attach --existing switch-missing /bin/sh -c "touch '$marker'"
   [ "$status" -ne 0 ]
   [ ! -e "$marker" ]
 
   run "$ZMX" list --short
   [ "$status" -eq 0 ]
-  [[ "$output" != *"test-switch-missing"* ]]
+  [[ "$output" != *"switch-missing"* ]]
 }
 
 @test "attach --existing preserves strict mode after a live switch" {
-  "$ZMX" run existing-src -d /bin/sh
+  "$ZMX" run existing-src -d /bin/sh -i
   wait_for_session existing-src
 
   local input="$BATS_TEST_TMPDIR/existing-input"
@@ -395,4 +395,3 @@ load test_helper
   [[ "$output" != *"<1234567890"* ]]
   [[ "$output" == *"12345678901234567890"* ]]
 }
-
